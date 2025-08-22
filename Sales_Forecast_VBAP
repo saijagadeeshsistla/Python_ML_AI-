@@ -1,0 +1,272 @@
+"""
+SAP Sales Forecasting — End‑to‑End Python Script
+
+What it does
+------------
+1) Loads SAP sales data from CSV/Excel (exported from SAP SD/MM/HANA views)
+2) Cleans and aggregates to a time series (daily/weekly/monthly)
+3) Builds features (lags, rolling means, calendar flags)
+4) Trains a time-aware model (RandomForest) on past data
+5) Generates H-step forecasts with backtesting metrics (RMSE, MAPE)
+6) Saves a forecast CSV and (optionally) plots actual vs. forecast
+
+Usage (examples)
+----------------
+python sap_sales_forecast.py --input ./sap_sales.csv --date_col DocumentDate \
+  --qty_col Quantity --material_col Material --group_by Material \
+  --material_id 10001234 --freq M --horizon 6 --plot
+
+Minimal usage (aggregate all sales):
+python sap_sales_forecast.py --input ./sap_sales.csv --date_col DocumentDate --qty_col NetValue --freq M --horizon 6
+
+Input expectations
+------------------
+- CSV/Excel should have at least a date column and a numeric measure (quantity or value).
+- Optional columns for filtering: Material, Plant, SalesOrg, etc.
+
+Notes
+-----
+- Designed to work with standard libraries available in most Python envs (pandas, numpy, scikit-learn, statsmodels optional for diagnostics not required).
+- If you have HANA access, you can replace the loader with a SQL query (template included below, commented out).
+"""
+
+import argparse
+import os
+import sys
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+
+try:
+    import matplotlib.pyplot as plt  # Only used if --plot is given
+except Exception:  # pragma: no cover
+    plt = None
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SAP Sales Forecasting")
+    p.add_argument("--input", required=True, help="Path to SAP export file (.csv or .xlsx)")
+    p.add_argument("--sheet", default=None, help="Excel sheet name if .xlsx")
+    p.add_argument("--date_col", required=True, help="Column with document/posting date")
+    p.add_argument("--qty_col", required=True, help="Numeric column to forecast (e.g., Quantity or NetValue)")
+    p.add_argument("--group_by", default=None, help="Column to group by (e.g., Material)")
+    p.add_argument("--material_col", default=None, help="Alias for --group_by if clearer")
+    p.add_argument("--material_id", default=None, help="Value within group_by to filter (e.g., SKU code)")
+    p.add_argument("--plant", default=None, help="Filter by Plant code (optional)")
+    p.add_argument("--plant_col", default="Plant", help="Column name for Plant (optional)")
+    p.add_argument("--freq", default="M", choices=["D","W","M"], help="Resample frequency: D/W/M")
+    p.add_argument("--horizon", type=int, default=6, help="Forecast horizon in periods of --freq")
+    p.add_argument("--min_periods", type=int, default=24, help="Minimum periods required to train")
+    p.add_argument("--plot", action="store_true", help="Plot actual vs forecast")
+    p.add_argument("--output", default="forecast_output.csv", help="Path to save forecast CSV")
+    return p.parse_args()
+
+
+def load_data(path: str, sheet: Optional[str] = None) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        df = pd.read_csv(path)
+    elif ext in (".xlsx", ".xls"):
+        df = pd.read_excel(path, sheet_name=sheet or 0)
+    else:
+        raise ValueError("Unsupported file format: use .csv or .xlsx")
+    return df
+
+
+# HANA/Database template (optional)
+# ---------------------------------
+# import sqlalchemy as sa
+# def load_from_hana(conn_str: str, sql: str) -> pd.DataFrame:
+#     eng = sa.create_engine(conn_str)
+#     with eng.connect() as cx:
+#         return pd.read_sql(sql, cx)
+# Example conn_str: 'hana+pyhdb://USER:PASSWORD@host:30015'
+# Example sql: SELECT BILL_DATE as DocumentDate, MATERIAL as Material, NET_VALUE as NetValue FROM SALES_VIEW
+
+
+def prepare_timeseries(df: pd.DataFrame,
+                       date_col: str,
+                       y_col: str,
+                       freq: str = "M",
+                       group_by: Optional[str] = None,
+                       group_val: Optional[str] = None,
+                       plant_col: Optional[str] = None,
+                       plant: Optional[str] = None) -> pd.Series:
+    # Standardize column names via direct references
+    d = df.copy()
+
+    # Filter by plant if requested
+    if plant and plant_col and plant_col in d.columns:
+        d = d[d[plant_col].astype(str) == str(plant)]
+
+    # Filter by group (e.g., specific Material)
+    gb_col = group_by
+    if gb_col is None and group_val is not None:
+        raise ValueError("Provide --group_by/--material_col when using --material_id")
+    if group_by is None and plant is None:
+        pass
+
+    if gb_col and gb_col not in d.columns:
+        raise ValueError(f"group_by column '{gb_col}' not found in data")
+
+    if gb_col and group_val is not None:
+        d = d[d[gb_col].astype(str) == str(group_val)]
+
+    # Parse dates and coerce numeric
+    if date_col not in d.columns:
+        raise ValueError(f"date_col '{date_col}' not found in data")
+    if y_col not in d.columns:
+        raise ValueError(f"qty_col '{y_col}' not found in data")
+
+    d[date_col] = pd.to_datetime(d[date_col], errors='coerce')
+    d = d.dropna(subset=[date_col])
+
+    d[y_col] = pd.to_numeric(d[y_col], errors='coerce')
+    d = d.dropna(subset=[y_col])
+
+    # Aggregate to daily, then resample
+    daily = (d.groupby(d[date_col].dt.to_period('D'))[y_col]
+               .sum()
+               .to_timestamp())
+
+    ts = daily.resample(freq).sum().fillna(0.0)
+    ts.name = y_col
+    return ts
+
+
+def build_features(ts: pd.Series) -> pd.DataFrame:
+    df = ts.to_frame(name='y').copy()
+    df['t'] = np.arange(len(df))
+    # Calendar features
+    idx = df.index
+    df['year'] = idx.year
+    df['month'] = idx.month
+    df['week'] = getattr(idx, 'isocalendar').week if hasattr(getattr(idx, 'isocalendar', None), 'week') else getattr(idx, 'week', 0)
+    df['quarter'] = idx.quarter
+
+    # Lag features (handle frequency-agnostic with 1, 2, 3, 6, 12 periods)
+    for L in [1, 2, 3, 6, 12]:
+        df[f'lag_{L}'] = df['y'].shift(L)
+    # Rolling means
+    for W in [3, 6, 12]:
+        df[f'roll_mean_{W}'] = df['y'].shift(1).rolling(W).mean()
+        df[f'roll_std_{W}'] = df['y'].shift(1).rolling(W).std()
+
+    df = df.dropna()
+    return df
+
+
+def time_split(df: pd.DataFrame, horizon: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if len(df) <= horizon:
+        raise ValueError("Not enough history; reduce horizon or collect more data")
+    train = df.iloc[:-horizon]
+    test = df.iloc[-horizon:]
+    return train, test
+
+
+def fit_model(train: pd.DataFrame) -> RandomForestRegressor:
+    X = train.drop(columns=['y'])
+    y = train['y']
+    model = RandomForestRegressor(
+        n_estimators=400,
+        max_depth=None,
+        min_samples_split=3,
+        min_samples_leaf=1,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X, y)
+    return model
+
+
+def evaluate(model, test: pd.DataFrame) -> Tuple[float, float]:
+    X_test = test.drop(columns=['y'])
+    y_true = test['y']
+    y_pred = model.predict(X_test)
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    mape = float(np.mean(np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-8, None))) * 100)
+    return rmse, mape
+
+
+def iterative_forecast(model: RandomForestRegressor, ts: pd.Series, horizon: int) -> pd.Series:
+    history = ts.copy()
+    forecasts = []
+    freq = ts.index.freq or pd.infer_freq(ts.index) or 'M'
+
+    for i in range(horizon):
+        feats = build_features(history).iloc[[-1]].drop(columns=['y'])
+        y_hat = float(model.predict(feats)[0])
+        next_idx = (history.index[-1] + pd.tseries.frequencies.to_offset(freq))
+        history.loc[next_idx] = y_hat
+        forecasts.append((next_idx, y_hat))
+
+    fc = pd.Series({idx: val for idx, val in forecasts})
+    fc.name = 'forecast'
+    return fc
+
+
+def run_pipeline(args):
+    df = load_data(args.input, args.sheet)
+
+    group_by = args.group_by or args.material_col
+
+    ts = prepare_timeseries(
+        df,
+        date_col=args.date_col,
+        y_col=args.qty_col,
+        freq=args.freq,
+        group_by=group_by,
+        group_val=args.material_id,
+        plant_col=args.plant_col,
+        plant=args.plant,
+    )
+
+    if len(ts) < args.min_periods:
+        raise ValueError(f"Need at least {args.min_periods} periods; found {len(ts)}")
+
+    feat_df = build_features(ts)
+    train, test = time_split(feat_df, args.horizon)
+    model = fit_model(train)
+
+    rmse, mape = evaluate(model, test)
+    print(f"Backtest — RMSE: {rmse:.2f}, MAPE: {mape:.2f}% (horizon={args.horizon})")
+
+    # Refit on full history for final forecast
+    model = fit_model(feat_df)
+    fc = iterative_forecast(model, ts, args.horizon)
+
+    out = pd.DataFrame({
+        'actual': ts, 
+        'forecast': fc
+    })
+
+    # Align index and write CSV
+    out.index.name = 'Period'
+    out.to_csv(args.output)
+    print(f"Saved forecast to: {os.path.abspath(args.output)}")
+
+    if args.plot:
+        if plt is None:
+            print("matplotlib not available; skipping plot")
+        else:
+            plt.figure(figsize=(10,5))
+            ts.plot(label='Actual')
+            fc.plot(label='Forecast')
+            plt.title('SAP Sales: Actual vs Forecast')
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+
+if __name__ == "__main__":
+    # If run as a script via the canvas, you can simulate CLI by editing below
+    if len(sys.argv) == 1:
+        print("Tip: supply --input, --date_col, --qty_col. See header for examples.")
+    args = parse_args()
+    run_pipeline(args)
